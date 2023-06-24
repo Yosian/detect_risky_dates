@@ -1,0 +1,192 @@
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, Optional, Union
+
+import boto3 as boto3
+import pandas as pd
+import numpy as np
+import yaml
+import yfinance
+import plotly.graph_objects as go
+from keras import Sequential, callbacks
+from keras.layers import LSTM, Dropout, Dense, RepeatVector, TimeDistributed
+from sklearn.preprocessing import StandardScaler
+
+
+@dataclass
+class CaseData:
+    ticker: str
+    date: pd.Timestamp
+    bucket: str
+    s3_path: str
+    local_client_data_csv: str
+    local_results_yaml: str
+
+
+class CommunicateS3:
+    def __init__(self):
+        self.s3 = boto3.client("s3")
+
+    def download(self):
+        self.s3.download_file(
+            Bucket=cd.bucket,
+            Key=f"{cd.s3_path}/{cd.local_client_data_csv}",
+            Filename=cd.local_client_data_csv
+        )
+
+    def upload(self):
+        self.s3.upload_file(
+            Bucket=cd.bucket,
+            Key=f"{cd.s3_path}/{cd.local_results_yaml}",
+            Filename=cd.local_results_yaml
+        )
+
+
+def obtain_instrument_date_dictionary() -> Dict:
+    absolute_path = 'C:/Users/j.quintana-arroyo/PycharmProjects/DetectRelevantDates/'
+    temp = pd.read_csv(f'{absolute_path}client_data.csv')
+    temp.date = pd.to_datetime(temp.date, yearfirst=True)
+    return dict(zip(temp.instrument, temp.date))
+
+
+def obtain_ticker_history(ticker: str = 'TSLA',
+                          start_date: pd.Timestamp = pd.to_datetime('2022-12-31'),
+                          time_offset: int = 1500) -> pd.DataFrame:
+    """
+    Downloads pricing data from yfinance for the ticker required
+    :param ticker: a ticker corresponding to the instrument we need
+    :param start_date: this will be the date when the transaction happened
+    :param time_offset: number of historical days before transaction date to appear in
+    the price history
+    :return: pd.DataFrame containing pricing data for the ticker
+    """
+    # Download the data from yfinance
+    temp = yfinance.download(ticker, start=start_date + pd.DateOffset(days=-time_offset))
+    temp.reset_index(inplace=True)
+    return temp
+
+
+def visualise_figure(frame: pd.DataFrame) -> None:
+    global ticker
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=frame.index, y=frame['Close'], name='Close price'))
+    fig.update_layout(showlegend=True,
+                      title=f'{ticker} Stock Price {frame.index.min()}-{frame.index.max()}')
+    fig.show()
+
+
+def visualise_anomalies(frame: pd.DataFrame) -> None:
+    anomalies = frame.loc[frame.anomaly].copy()
+    extremes = frame.loc[frame.loss == frame.loss.max()].copy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(x=frame['Date'], y=frame['Close'], name='Close price'))
+    fig.add_trace(
+        go.Scatter(x=extremes['Date'], y=extremes['Close'], name='Most unusual day'))
+    fig.add_trace(go.Scatter(x=anomalies['Date'], y=anomalies['Close'], mode='markers',
+                             name='Anomaly'))
+    fig.update_layout(showlegend=True, title='Detected anomalies')
+    fig.show()
+    # fig.write_image('anomaly.png')
+
+
+def create_sequences(X, y, time_steps: int = 30):
+    Xs, ys = [], []
+    for i in range(len(X) - time_steps):
+        Xs.append(X[i:(i + time_steps)])
+        ys.append(y[i + time_steps])
+
+    return np.array(Xs), np.array(ys)
+
+
+def generate_model(x: np.ndarray, y: np.ndarray):
+    model = Sequential()
+    model.add(LSTM(128, input_shape=(x.shape[1], x.shape[2])))
+    model.add(Dropout(rate=0.2))
+    model.add(RepeatVector(x.shape[1]))
+    model.add(LSTM(128, return_sequences=True))
+    model.add(Dropout(rate=0.2))
+    model.add(TimeDistributed(Dense(x.shape[2])))
+    model.compile(optimizer='adam', loss='mae')
+
+    model.fit(x, y, epochs=100, batch_size=32, validation_split=0.1,
+              callbacks=[callbacks.EarlyStopping(monitor='val_loss', patience=3,
+                                                 mode='min')], shuffle=False)
+    return model
+
+
+def calculate_mae_loss(real_array: np.ndarray, pred_array: np.ndarray) -> np.ndarray:
+    return np.mean(np.abs(pred_array - real_array), axis=1)
+
+
+def create_yaml(frame: pd.DataFrame, cdata: CaseData):
+    frame.sort_values(['loss'], ascending=False, inplace=True)
+    frame = frame[['Date', 'anomaly', 'threshold', 'loss']][:5].astype(str)
+    data = {}
+    for _, value in frame.iterrows():
+        data[str(value['Date']).split(' ')[0]] = {
+            'loss': str(value['loss']), 'is_anomaly': str(value['anomaly'])
+        }
+    d_for_yaml = {'ticker': cdata.ticker,
+                  'transaction date': str(cdata.date).split(' ')[0],
+                  'threshold': str(frame.threshold.values[0]),
+                  'data': data}
+    with open('anomaly_dates.yaml', 'w') as yaml_file:
+        yaml.dump(d_for_yaml, yaml_file, default_flow_style=False)
+
+
+# define case
+cd = CaseData(ticker='TSLA',
+              date=pd.to_datetime('2022-12-31'),
+              s3_path='client_123',
+              bucket='aws-jos-data',
+              local_client_data_csv='client_data.csv',
+              local_results_yaml='anomaly_dates.yaml')
+
+# initialise s3 communications
+cs3 = CommunicateS3()
+
+# get file from s3
+cs3.download()
+
+# obtain price history and split (before trade) | (after trade)
+df = obtain_ticker_history(ticker=cd.ticker, start_date=cd.date)
+train = df.loc[df.Date <= cd.date + pd.DateOffset(days=-50)]
+test = df.loc[df.Date > cd.date + pd.DateOffset(days=-50)]
+
+scaler = StandardScaler()
+scaler = scaler.fit(train[['Close']])
+
+tr = scaler.transform(train[['Close']])
+te = scaler.transform(test[['Close']])
+
+lookback_window = 30
+
+# create arrays
+X_train, y_train = create_sequences(tr, tr, time_steps=lookback_window)
+X_test, y_test = create_sequences(te, te, time_steps=lookback_window)
+
+# model the NNetwork
+mod = generate_model(x=X_train, y=y_train)
+
+# calculate threshold at a couple of standard deviations
+prediction = mod.predict(x=X_train)
+train_mae_loss = np.mean(np.abs(prediction - X_train), axis=1)
+threshold = np.mean(np.abs(train_mae_loss)) + 2 * np.std(np.abs(train_mae_loss))
+
+# calculate loss for the predicted values in the test
+prediction = mod.predict(X_test, verbose=0)
+test_mae_loss = np.mean(np.abs(prediction - X_test), axis=1)
+
+# form dataframe
+test_score_df = pd.DataFrame(test[lookback_window:])
+test_score_df['loss'] = test_mae_loss
+
+test_score_df['threshold'] = threshold
+test_score_df['anomaly'] = test_score_df['loss'] > test_score_df['threshold']
+
+create_yaml(frame=test_score_df, cdata=cd)
+
+# upload yaml to s3
+cs3.upload()
